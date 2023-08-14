@@ -1,20 +1,21 @@
-[tool.poetry]
+[project]
 name = "playground"
 version = "0.1.0"
-description = ""
-authors = ["ZheyangXu <jishengxzy@hotmail.com>"]
-license = "MIT"
+description = "a playground of reinforcement learning."
+authors = [
+    {name = "ZheyangXu",email = "jishengxzy@hotmail.com"},
+]
+dependencies = [
+    "torch>=2.0.1",
+    "numpy>=1.25.2",
+    "gymnasium>=0.29.0",
+    "matplotlib>=3.7.2",
+    "tqdm>=4.66.1",
+]
+requires-python = ">=3.9"
 readme = "README.md"
-
-[tool.poetry.dependencies]
-python = "^3.9"
-torch = "^2.0.1"
-numpy = "^1.25.0"
-gymnasium = "^0.28.1"
-matplotlib = "^3.7.1"
-tqdm = "^4.65.0"
-
+license = {text = "MIT"}
 
 [build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+requires = ["pdm-backend"]
+build-backend = "pdm.backend"
