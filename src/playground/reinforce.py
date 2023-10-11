@@ -1,6 +1,7 @@
 # -*- coding: UTF-8 -*-
+
 from dataclasses import dataclass
-from typing import Any, Dict, Type, Union
+from typing import Any, Dict, List, Type, Union
 
 import gymnasium as gym
 import matplotlib.pyplot as plt
@@ -8,12 +9,23 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.optim as optim
 from tqdm import tqdm
 
 Observation = Type[np.ndarray]
 ActionProbs = Type[np.ndarray]
 Action = Type[int]
+Reward = Type[float]
 Environment = Type[Any]
+
+
+@dataclass
+class Trajectory(object):
+    state: Observation
+    action: Action
+    reward: Reward
+    next_state: Observation
+    done: bool
 
 
 class PolicyNet(nn.Module):
@@ -27,46 +39,27 @@ class PolicyNet(nn.Module):
         return F.softmax(self.fc2(x), dim=1)
 
 
-class REINFORCEPolicy(object):
+def as_tensor(x, dtype=torch.float, device="cpu") -> torch.Tensor:
+    return torch.as_tensor(x, dtype=dtype, device=device)
+
+
+class Actor(object):
     def __init__(
         self,
-        state_dim: int,
-        hidden_dim: int,
-        action_dim: int,
-        learning_rate: float,
-        gamma: float,
-        device: str,
+        model: PolicyNet,
+        learning_rate: float = 0.001,
+        device: str = "cpu",
     ) -> None:
-        self.policy_net = PolicyNet(state_dim, hidden_dim, action_dim).to(device)
-        self.optimizer = torch.optim.Adam(
-            self.policy_net.parameters(), lr=learning_rate
-        )
-        self.gamma = gamma
+        self.model = model.to(device)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
         self.device = device
 
     def take_action(self, state: Observation) -> Action:
-        state = torch.tensor([state], dtype=torch.float).to(self.device)
-        probs = self.policy_net(state)
+        state = as_tensor([state], torch.float, self.device)
+        probs = self.model(state)
         action_dist = torch.distributions.Categorical(probs=probs)
         action = action_dist.sample()
         return action.item()
-
-    def update(self, transition_dict: Dict[str, Any]) -> None:
-        reward_list = transition_dict['rewards']
-        state_list = transition_dict['states']
-        action_list = transition_dict['actions']
-
-        G = 0
-        self.optimizer.zero_grad()
-        for i in reversed(range(len(reward_list))):
-            reward = reward_list[i]
-            state = torch.tensor([state_list[i]], dtype=torch.float).to(self.device)
-            action = torch.tensor(action_list[i]).view(-1, 1).to(self.device)
-            log_prob = torch.log(self.policy_net(state).gather(1, action))
-            G = self.gamma * G + reward
-            loss = -log_prob * G
-            loss.backward()
-        self.optimizer.step()
 
 
 @dataclass
@@ -83,7 +76,7 @@ class REINFORCEParams(Params):
     target_update: int = 10
     buffer_size: int = 10000
     minimal_size: int = 500
-    device: Union[str, torch.device] = "cuda"
+    device: Union[str, torch.device] = "mps"
     epochs: int = 10
     seed: int = 0
     env_name: str = "CartPole-v0"
@@ -91,9 +84,38 @@ class REINFORCEParams(Params):
     batch_size: int = 64
 
 
+class Reinforce(object):
+    def __init__(self, actor: Actor, gamma: float, device: float = "cpu") -> None:
+        self.actor = actor
+        self.gamma = gamma
+        self.device = device
+
+    def take_action(self, state: Observation) -> Action:
+        return self.actor.take_action(state)
+
+    def update(self, transitions: List[Trajectory]) -> None:
+        rewards = [trajectory.reward for trajectory in transitions]
+        states = [trajectory.state for trajectory in transitions]
+        actions = [trajectory.action for trajectory in transitions]
+
+        G = 0
+        self.actor.optimizer.zero_grad()
+        for i in reversed(range(len(rewards))):
+            reward = rewards[i]
+            state = as_tensor([states[i]], dtype=torch.float, device=self.device)
+            action = as_tensor(actions[i], dtype=torch.int64, device=self.device).view(
+                -1, 1
+            )
+            log_prob = torch.log(self.actor.model(state).gather(1, action))
+            G = self.gamma * G + reward
+            loss = -log_prob * G
+            loss.backward()
+        self.actor.optimizer.zero_grad()
+
+
 class OnPolicyTrainer(object):
     def __init__(
-        self, policy: REINFORCEPolicy, env: Environment, params: Params
+        self, policy: Reinforce, env: gym.Env, params: REINFORCEParams
     ) -> None:
         self.policy = policy
         self.env = env
@@ -107,30 +129,22 @@ class OnPolicyTrainer(object):
             ) as pbar:
                 for i_episode in range(int(self.params.num_episodes / 10)):
                     episode_return = 0
-                    transition_dict = {
-                        "states": [],
-                        "actions": [],
-                        "next_states": [],
-                        "rewards": [],
-                        "dones": [],
-                    }
                     state, _ = self.env.reset()
                     done = False
+                    trajectories = []
                     while not done:
                         action = self.policy.take_action(state)
                         next_state, reward, terminated, truncated, _ = self.env.step(
                             action
                         )
                         done = terminated or truncated
-                        transition_dict["states"].append(state)
-                        transition_dict["actions"].append(action)
-                        transition_dict["next_states"].append(next_state)
-                        transition_dict["rewards"].append(reward)
-                        transition_dict["dones"].append(done)
+                        trajectories.append(
+                            Trajectory(state, action, reward, next_state, done)
+                        )
                         state = next_state
                         episode_return += reward
                     return_list.append(episode_return)
-                    self.policy.update(transition_dict)
+                    self.policy.update(trajectories)
                     if (i_episode + 1) % 10 == 0:
                         pbar.set_postfix(
                             {
@@ -144,20 +158,17 @@ class OnPolicyTrainer(object):
 
 
 def main():
-    env_name = 'CartPole-v0'
+    env_name = "CartPole-v0"
     env = gym.make(env_name)
     params = REINFORCEParams()
-    agent = REINFORCEPolicy(
-        env.observation_space.shape[0],
-        params.hidden_dim,
-        env.action_space.n,
-        params.learning_rate,
-        params.gamma,
-        params.device
-    )
-    trainer = OnPolicyTrainer(agent, env, params)
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.n
+    model = PolicyNet(state_dim, params.hidden_dim, action_dim)
+    actor = Actor(model, params.learning_rate, params.device)
+    policy = Reinforce(actor, params.gamma, params.device)
+    trainer = OnPolicyTrainer(policy, env, params)
     trainer.learn()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

@@ -11,36 +11,38 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.optim as optim
 from tqdm import tqdm
 
 Observation = Type[np.ndarray]
 Action = Type[int]
 Reward = Type[float]
-Experience = Type[Tuple[Observation, Action, Reward, Observation, bool]]
-Environment = Type[Any]
+Environment = Type[gym.Env]
+
+
+@dataclass
+class Trajectory(object):
+    state: Observation
+    action: Action
+    reward: Reward
+    next_state: Observation
+    done: bool
 
 
 class ReplayBuffer(object):
     def __init__(self, capacity: int) -> None:
-        self.buffer: List[Experience] = collections.deque(maxlen=capacity)
+        self.buffer: List[Trajectory] = collections.deque(maxlen=capacity)
 
-    def add(
-        self,
-        state: Observation,
-        action: Action,
-        reward: Reward,
-        next_state: Observation,
-        done: bool,
-    ) -> None:
-        self.buffer.append((state, action, reward, next_state, done))
-
-    def sample(self, batch_size: int) -> List[Experience]:
-        transitions = random.sample(self.buffer, batch_size)
-        state, action, reward, next_state, done = zip(*transitions)
-        return np.array(state), action, reward, np.array(next_state), done
+    def add(self, trajectory: Trajectory) -> int:
+        self.buffer.append(trajectory)
+        return self.size()
 
     def size(self) -> int:
         return len(self.buffer)
+
+    def sample(self, batch_size: int) -> List[Trajectory]:
+        transitions = random.sample(self.buffer, batch_size)
+        return transitions
 
 
 class QNet(nn.Module):
@@ -54,60 +56,95 @@ class QNet(nn.Module):
         return self.fc2(x)
 
 
-class DQNPolicy(object):
+class VAnet(nn.Module):
+    def __init__(self, state_dim: int, hidden_dim: int, action_dim: int) -> None:
+        super(VAnet, self).__init__()
+        self.fc1 = nn.Linear(state_dim, hidden_dim)
+        self.fc_a = nn.Linear(hidden_dim, action_dim)
+        self.fc_v = nn.Linear(hidden_dim, 1)
+
+    def forward(self, state: torch.Tensor) -> float:
+        a = self.fc_a(F.relu(self.fc1(state)))
+        v = self.fc_v(F.relu(self.fc1(state)))
+        return v + a - a.mean(1).view(-1, 1)
+
+
+def as_tensor(x, dtype=torch.float, device="cpu") -> torch.Tensor:
+    return torch.as_tensor(x, dtype=dtype, device=device)
+
+
+class Actor(object):
     def __init__(
         self,
-        state_dim: int,
-        hidden_dim: int,
+        model: nn.Module,
         action_dim: int,
+        episilon: float,
         learning_rate: float,
-        gamma: float,
-        epsilon: float,
-        target_update: int,
-        device: str,
+        device: str = "cpu",
     ) -> None:
+        self.model = model
         self.action_dim = action_dim
-        self.q_net = QNet(state_dim, hidden_dim, action_dim).to(device)
-        self.target_q_net = QNet(state_dim, hidden_dim, action_dim).to(device)
-
-        self.optimizer = torch.optim.Adam(self.q_net.parameters(), lr=learning_rate)
-        self.gamma = gamma
-        self.epsilon = epsilon
-        self.target_update = target_update
-        self.count = 0
+        self.episilon = episilon
         self.device = device
+        self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
 
-    def _as_tensor(self, x, dtype=torch.float) -> torch.Tensor:
-        return torch.as_tensor(x, dtype=dtype, device=self.device)
+    def __call__(self, states: Observation, *args: Any, **kwds: Any) -> float:
+        return self.model(states)
+
+    def values(self, states: Observation) -> float:
+        return self.model(states)
 
     def take_action(self, state: Observation) -> Action:
-        if np.random.random() < self.epsilon:
+        if np.random.random() < self.episilon:
             action = np.random.randint(self.action_dim)
         else:
-            state = self._as_tensor([state])
-            action = self.q_net(state).argmax().item()
+            state = as_tensor([state])
+            action = self.model(state).argmax().item()
         return action
 
-    def update(self, transition_dic: Dict[str, Any]) -> None:
-        states = self._as_tensor(transition_dic["states"])
-        actions = self._as_tensor(transition_dic["actions"]).view(-1, 1)
-        rewards = self._as_tensor(transition_dic["rewards"]).view(-1, 1)
-        next_states = self._as_tensor(transition_dic["next_states"])
-        dones = self._as_tensor(transition_dic["dones"]).view(-1, 1)
+    def max_q_values(self, state: Observation) -> float:
+        state = as_tensor([state])
+        return self.model(state).max().item()
 
-        q_values = self.q_net(states).gather(
-            1, self._as_tensor(actions, dtype=torch.int64)
+
+class DQN(object):
+    def __init__(
+        self, actor: Actor, gamma: float, target_update: int = 2, dqn_type="VanillaDQN"
+    ) -> None:
+        self.actor = actor
+        self.target_actor = actor
+        self.gamma = gamma
+        self.dqn_type = dqn_type
+        self.target_update = target_update
+        self.count = 0
+
+    def take_action(self, state: Observation) -> Action:
+        return self.actor.take_action(state)
+
+    def update(self, transitions: List[Trajectory]) -> None:
+        states = as_tensor([trajectory.state for trajectory in transitions])
+        actions = as_tensor([trajectory.action for trajectory in transitions]).view(
+            -1, 1
         )
-        max_next_q_values = self.target_q_net(next_states).max(1)[0].view(-1, 1)
+        rewards = as_tensor([trajectory.reward for trajectory in transitions]).view(
+            -1, 1
+        )
+        next_states = as_tensor([trajectory.next_state for trajectory in transitions])
+        dones = as_tensor([trajectory.done for trajectory in transitions]).view(-1, 1)
+
+        q_values = self.actor.model(states).gather(
+            1, as_tensor(actions, dtype=torch.int64)
+        )
+        max_next_q_values = self.target_actor.model(next_states).max(1)[0].view(-1, 1)
         q_targets = rewards + self.gamma * max_next_q_values * (1 - dones)
 
         loss = torch.mean(F.mse_loss(q_values, q_targets))
-        self.optimizer.zero_grad()
+        self.actor.optimizer.zero_grad()
         loss.backward()
-        self.optimizer.step()
+        self.actor.optimizer.step()
 
         if self.count % self.target_update == 0:
-            self.target_q_net.load_state_dict(self.q_net.state_dict())
+            self.target_actor.model.load_state_dict(self.actor.model.state_dict())
         self.count += 1
 
 
@@ -125,7 +162,7 @@ class DQNParams(Params):
     target_update: int = 10
     buffer_size: int = 10000
     minimal_size: int = 500
-    device: Union[str, torch.device] = "cuda"
+    device: Union[str, torch.device] = "mps"
     epochs: int = 10
     seed: int = 0
     env_name: str = "CartPole-v0"
@@ -135,11 +172,7 @@ class DQNParams(Params):
 
 class OffPolicyTrainer(object):
     def __init__(
-        self,
-        policy: DQNPolicy,
-        env: Environment,
-        params: Params,
-        replay_buffer: ReplayBuffer,
+        self, policy: DQN, env: Environment, params: Params, replay_buffer: ReplayBuffer
     ) -> None:
         self.policy = policy
         self.env = env
@@ -153,7 +186,7 @@ class OffPolicyTrainer(object):
                 total=int(self.params.num_episodes / 10), desc="Interation %d" % i
             ) as pbar:
                 for i_episode in range(int(self.params.num_episodes / 10)):
-                    episode_retrun = 0
+                    episode_return = 0
                     state, _ = self.env.reset()
                     done = False
                     while not done:
@@ -162,26 +195,17 @@ class OffPolicyTrainer(object):
                             action
                         )
                         done = terminated or truncated
-                        self.replay_buffer.add(state, action, reward, next_state, done)
+                        trajectory = Trajectory(state, action, reward, next_state, done)
+                        self.replay_buffer.add(trajectory)
                         state = next_state
-                        episode_retrun += reward
+                        episode_return += reward
                         if self.replay_buffer.size() > self.params.minimal_size:
-                            (
-                                batch_states,
-                                batch_actions,
-                                batch_rewards,
-                                batch_next_states,
-                                batch_dones,
-                            ) = self.replay_buffer.sample(self.params.batch_size)
-                            transition_dict = {
-                                "states": batch_states,
-                                "actions": batch_actions,
-                                "rewards": batch_rewards,
-                                "next_states": batch_next_states,
-                                "dones": batch_dones,
-                            }
-                            self.policy.update(transition_dict)
-                    return_list.append(episode_retrun)
+                            trajectories = self.replay_buffer.sample(
+                                self.params.batch_size
+                            )
+                            self.policy.update(trajectories)
+
+                    return_list.append(episode_return)
                     if (i_episode + 1) % 10 == 0:
                         pbar.set_postfix(
                             {
@@ -194,28 +218,20 @@ class OffPolicyTrainer(object):
                     pbar.update(1)
 
 
-class Experiment(object):
-    def __init__(self, params: Params) -> None:
-        pass
-
-
 def main():
     env_name = "CartPole-v0"
     env = gym.make(env_name)
     params = DQNParams()
-    agent = DQNPolicy(
-        env.observation_space.shape[0],
-        params.hidden_dim,
-        env.action_space.n,
-        params.learning_rate,
-        params.gamma,
-        params.epsilon,
-        params.target_update,
-        params.device,
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.n
+    model = QNet(state_dim, params.hidden_dim, action_dim)
+    actor = Actor(
+        model, action_dim, params.epsilon, params.learning_rate, params.device
     )
+    policy = DQN(actor, params.gamma)
     replay_buffer = ReplayBuffer(params.buffer_size)
-    trainer = OffPolicyTrainer(agent, env, params, replay_buffer)
-    trainer.learn()
+    trainner = OffPolicyTrainer(policy, env, params, replay_buffer)
+    trainner.learn()
 
 
 if __name__ == "__main__":
