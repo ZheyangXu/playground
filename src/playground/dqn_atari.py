@@ -149,7 +149,7 @@ class DQNParams(Params):
     target_update: int = 10
     buffer_size: int = 10000
     minimal_size: int = 500
-    device: Union[str, torch.device] = "cuda"
+    device: Union[str, torch.device] = "mps"
     epochs: int = 10
     seed: int = 0
     env_name: str = "CartPole-v0"
