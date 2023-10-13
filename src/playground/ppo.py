@@ -39,6 +39,20 @@ class PolicyNet(nn.Module):
         return F.softmax(self.fc2(x), dim=1)
 
 
+class PolicyNetContinuous(nn.Module):
+    def __init__(self, state_dim: int, hidden_dim: int, action_dim: int) -> None:
+        super(PolicyNetContinuous, self).__init__()
+        self.fc1 = nn.Linear(state_dim, hidden_dim)
+        self.fc_mu = nn.Linear(hidden_dim, action_dim)
+        self.fc_std = nn.Linear(hidden_dim, action_dim)
+
+    def forward(self, states: Observation) -> Tuple[torch.Tensor, torch.Tensor]:
+        states = F.relu(self.fc1(states))
+        mu = 2.0 * torch.tanh(self.fc_mu(states))
+        std = F.softplus(self.fc_std(states))
+        return mu, std
+
+
 class ValueNet(nn.Module):
     def __init__(self, state_dim: int, hidden_dim: int) -> None:
         super(ValueNet, self).__init__()
@@ -68,6 +82,25 @@ class Actor(object):
         action_dist = torch.distributions.Categorical(probs)
         action = action_dist.sample()
         return action.item()
+
+
+class GaussianContinuousActor(object):
+    def __init__(
+        self,
+        model: PolicyNetContinuous,
+        learning_rate: float = 0.001,
+        device: str = "cpu",
+    ) -> None:
+        self.model = model.to(device)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
+        self.device = device
+
+    def take_action(self, state: Observation) -> Action:
+        state = torch.tensor([state], dtype=torch.float).to(self.device)
+        mu, sigma = self.model(state)
+        action_dist = torch.distributions.Normal(mu, sigma)
+        action = action_dist.sample()
+        return [action.item()]
 
 
 class Critic(object):
@@ -103,6 +136,7 @@ class PPO(object):
         epochs: int = 500,
         lmbda: float = 0.2,
         device: str = "cpu",
+        is_continuous: bool = False,
     ) -> None:
         self.actor = actor
         self.critic = critic
@@ -111,6 +145,7 @@ class PPO(object):
         self.epochs = epochs
         self.eps = eps
         self.device = device
+        self.is_continuous = is_continuous
 
     def update(self, trajectories: List[Trajectory]) -> None:
         states = as_tensor(
@@ -140,9 +175,23 @@ class PPO(object):
         advantage = compute_advantage(self.gamma, self.lmbda, td_delta.cpu()).to(
             self.device
         )
-        old_log_probs = torch.log(self.actor.model(states).gather(1, actions)).detach()
+        if self.is_continuous:
+            mu, std = self.actor.model(states)
+            action_dist = torch.distributions.Normal(mu.detach(), std.detach())
+            old_log_probs = action_dist.log_prob(actions)
+        else:
+            old_log_probs = torch.log(
+                self.actor.model(states).gather(1, actions)
+            ).detach()
         for _ in range(self.epochs):
-            log_probs = torch.log(self.actor.model(states).gather(1, actions))
+            if self.is_continuous:
+                mu, std = self.actor.model(states)
+                action_dist = torch.distributions.Normal(mu.detach(), std.detach())
+                log_probs = action_dist.log_prob(actions)
+            else:
+                log_probs = torch.log(
+                    self.actor.model(states).gather(1, actions)
+                ).detach()
             ratio = torch.exp(log_probs - old_log_probs)
             surr1 = ratio * advantage
             surr2 = torch.clamp(ratio, 1 - self.eps, 1 + self.eps) * advantage
@@ -152,6 +201,8 @@ class PPO(object):
             )
             self.actor.optimizer.zero_grad()
             self.critic.optimizer.zero_grad()
+            actor_loss.requires_grad_(True)
+            critic_loss.requires_grad_(True)
             actor_loss.backward()
             critic_loss.backward()
             self.actor.optimizer.step()
@@ -180,6 +231,7 @@ class PPOParams(Params):
     env_name: str = "CartPole-v0"
     hidden_dim: int = 128
     batch_size: int = 64
+    is_continuous: bool = False
 
 
 class OnPolicyTrainer(object):
@@ -248,6 +300,28 @@ def main():
         params.epochs,
         params.lmbda,
         params.device,
+    )
+    trainer = OnPolicyTrainer(policy, env, params)
+    trainer.learn()
+
+    env_name = "Pendulum-v1"
+    env = gym.make(env_name)
+    params.is_continuous = True
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
+    actor_net = PolicyNetContinuous(state_dim, params.hidden_dim, action_dim)
+    actor = GaussianContinuousActor(actor_net, params.learning_rate, params.device)
+    critic_net = ValueNet(state_dim, params.hidden_dim)
+    critic = Critic(critic_net, params.learning_rate, params.device)
+    policy = PPO(
+        actor,
+        critic,
+        params.gamma,
+        params.eps,
+        params.epochs,
+        params.lmbda,
+        params.device,
+        params.is_continuous,
     )
     trainer = OnPolicyTrainer(policy, env, params)
     trainer.learn()
