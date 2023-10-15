@@ -17,6 +17,7 @@ Reward = Type[float]
 Experience = Type[Tuple[Observation, Action, Reward, Observation, bool]]
 Environment = gym.Env
 Value = Type[float]
+Loss = Type[Any]
 
 
 @dataclass
@@ -83,6 +84,15 @@ class Actor(object):
         action = action_dist.sample()
         return action.item()
 
+    def update_step(self, loss: torch.Tensor) -> None:
+        self.optimizer.zero_grad()
+        loss.requires_grad_(True)
+        loss.backward()
+        self.optimizer.step()
+
+    def get_log_probs(self, states: Observation, actions: Action) -> torch.Tensor:
+        return torch.log(self.model(states).gather(1, actions)).detach()
+
 
 class GaussianContinuousActor(object):
     def __init__(
@@ -102,6 +112,17 @@ class GaussianContinuousActor(object):
         action = action_dist.sample()
         return [action.item()]
 
+    def update_step(self, loss: torch.Tensor) -> None:
+        self.optimizer.zero_grad()
+        loss.requires_grad_(True)
+        loss.backward()
+        self.optimizer.step()
+
+    def get_log_probs(self, states: Observation, actions: Action) -> torch.Tensor:
+        mu, std = self.model(states)
+        action_dist = torch.distributions.Normal(mu.detach(), std.detach())
+        return action_dist.log_prob(actions)
+
 
 class Critic(object):
     def __init__(
@@ -113,6 +134,12 @@ class Critic(object):
 
     def estimate_return(self, state: Observation) -> Value:
         return self.model(state)
+
+    def update_step(self, loss: torch.Tensor) -> None:
+        self.optimizer.zero_grad()
+        loss.requires_grad_(True)
+        loss.backward()
+        self.optimizer.step()
 
 
 def compute_advantage(gamma: float, lmbda: float, td_delta: torch.Tensor) -> float:
@@ -136,7 +163,6 @@ class PPO(object):
         epochs: int = 500,
         lmbda: float = 0.2,
         device: str = "cpu",
-        is_continuous: bool = False,
     ) -> None:
         self.actor = actor
         self.critic = critic
@@ -145,7 +171,40 @@ class PPO(object):
         self.epochs = epochs
         self.eps = eps
         self.device = device
-        self.is_continuous = is_continuous
+
+    def compute_advantages(
+        self,
+        states: Observation,
+        rewards: Reward,
+        actions: Action,
+        next_states: Observation,
+        dones: bool,
+    ) -> Loss:
+        td_target = rewards + self.gamma * self.critic.estimate_return(next_states) * (
+            1 - dones
+        )
+        td_delta = td_target - self.critic.estimate_return(next_states)
+        return compute_advantage(self.gamma, self.lmbda, td_delta.cpu()).to(self.device)
+
+    def get_actor_loss(
+        self,
+        old_log_probs: torch.Tensor,
+        states: Observation,
+        actions: Action,
+        advantages: torch.Tensor,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Loss:
+        log_probs = self.actor.get_log_probs(states, actions)
+        ratio = torch.exp(log_probs - old_log_probs)
+        surr1 = ratio * advantages
+        surr2 = torch.clamp(ratio, 1 - self.eps, 1 + self.eps) * advantages
+        return torch.mean(-torch.min(surr1, surr2))
+
+    def get_critic_loss(self, states: Observation, td_target: torch.Tensor) -> Loss:
+        return torch.mean(
+            F.mse_loss(self.critic.estimate_return(states), td_target.detach())
+        )
 
     def update(self, trajectories: List[Trajectory]) -> None:
         states = as_tensor(
@@ -171,42 +230,16 @@ class PPO(object):
         td_target = rewards + self.gamma * self.critic.estimate_return(next_states) * (
             1 - dones
         )
-        td_delta = td_target - self.critic.estimate_return(next_states)
-        advantage = compute_advantage(self.gamma, self.lmbda, td_delta.cpu()).to(
-            self.device
+        advantage = self.compute_advantages(
+            states, rewards, actions, next_states, dones
         )
-        if self.is_continuous:
-            mu, std = self.actor.model(states)
-            action_dist = torch.distributions.Normal(mu.detach(), std.detach())
-            old_log_probs = action_dist.log_prob(actions)
-        else:
-            old_log_probs = torch.log(
-                self.actor.model(states).gather(1, actions)
-            ).detach()
+
+        old_log_probs = self.actor.get_log_probs(states, actions)
         for _ in range(self.epochs):
-            if self.is_continuous:
-                mu, std = self.actor.model(states)
-                action_dist = torch.distributions.Normal(mu.detach(), std.detach())
-                log_probs = action_dist.log_prob(actions)
-            else:
-                log_probs = torch.log(
-                    self.actor.model(states).gather(1, actions)
-                ).detach()
-            ratio = torch.exp(log_probs - old_log_probs)
-            surr1 = ratio * advantage
-            surr2 = torch.clamp(ratio, 1 - self.eps, 1 + self.eps) * advantage
-            actor_loss = torch.mean(-torch.min(surr1, surr2))
-            critic_loss = torch.mean(
-                F.mse_loss(self.critic.estimate_return(states), td_target.detach())
-            )
-            self.actor.optimizer.zero_grad()
-            self.critic.optimizer.zero_grad()
-            actor_loss.requires_grad_(True)
-            critic_loss.requires_grad_(True)
-            actor_loss.backward()
-            critic_loss.backward()
-            self.actor.optimizer.step()
-            self.critic.optimizer.step()
+            actor_loss = self.get_actor_loss(old_log_probs, states, actions, advantage)
+            critic_loss = self.get_critic_loss(states, td_target)
+            self.actor.update_step(actor_loss)
+            self.critic.update_step(critic_loss)
 
 
 @dataclass
@@ -321,7 +354,6 @@ def main():
         params.epochs,
         params.lmbda,
         params.device,
-        params.is_continuous,
     )
     trainer = OnPolicyTrainer(policy, env, params)
     trainer.learn()
