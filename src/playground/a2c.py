@@ -39,6 +39,20 @@ class PolicyNet(nn.Module):
         return F.softmax(self.fc2(x), dim=1)
 
 
+class PolicyNetContinuous(nn.Module):
+    def __init__(self, state_dim: int, hidden_dim: int, action_dim: int) -> None:
+        super(PolicyNetContinuous, self).__init__()
+        self.fc1 = nn.Linear(state_dim, hidden_dim)
+        self.fc_mu = nn.Linear(hidden_dim, action_dim)
+        self.fc_std = nn.Linear(hidden_dim, action_dim)
+
+    def forward(self, states: Observation) -> Tuple[torch.Tensor, torch.Tensor]:
+        states = F.relu(self.fc1(states))
+        mu = 2.0 * torch.tanh(self.fc_mu(states))
+        std = F.softplus(self.fc_std(states))
+        return mu, std
+
+
 class ValueNet(nn.Module):
     def __init__(self, state_dim: int, hidden_dim: int) -> None:
         super(ValueNet, self).__init__()
@@ -69,6 +83,45 @@ class Actor(object):
         action = action_dist.sample()
         return action.item()
 
+    def update_step(self, loss: torch.Tensor) -> None:
+        self.optimizer.zero_grad()
+        loss.requires_grad_(True)
+        loss.backward()
+        self.optimizer.step()
+
+    def get_log_probs(self, states: Observation, actions: Action) -> torch.Tensor:
+        return torch.log(self.model(states).gather(1, actions)).detach()
+
+
+class GaussianContinuousActor(object):
+    def __init__(
+        self,
+        model: PolicyNetContinuous,
+        learning_rate: float = 0.001,
+        device: str = "cpu",
+    ) -> None:
+        self.model = model.to(device)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
+        self.device = device
+
+    def take_action(self, state: Observation) -> Action:
+        state = torch.tensor([state], dtype=torch.float).to(self.device)
+        mu, sigma = self.model(state)
+        action_dist = torch.distributions.Normal(mu, sigma)
+        action = action_dist.sample()
+        return [action.item()]
+
+    def update_step(self, loss: torch.Tensor) -> None:
+        self.optimizer.zero_grad()
+        loss.requires_grad_(True)
+        loss.backward()
+        self.optimizer.step()
+
+    def get_log_probs(self, states: Observation, actions: Action) -> torch.Tensor:
+        mu, std = self.model(states)
+        action_dist = torch.distributions.Normal(mu.detach(), std.detach())
+        return action_dist.log_prob(actions)
+
 
 class Critic(object):
     def __init__(
@@ -80,6 +133,12 @@ class Critic(object):
 
     def estimate_return(self, state: Observation) -> Value:
         return self.model(state)
+
+    def update_step(self, loss: torch.Tensor) -> None:
+        self.optimizer.zero_grad()
+        loss.requires_grad_(True)
+        loss.backward()
+        self.optimizer.step()
 
 
 class ActorCritic(object):
@@ -116,17 +175,13 @@ class ActorCritic(object):
             1 - dones
         )
         td_delta = td_target - self.critic.estimate_return(next_states)
-        log_probs = torch.log(self.actor.model(states).gather(1, actions))
+        log_probs = self.actor.get_log_probs(states, actions)
         actor_loss = torch.mean(-log_probs * td_delta.detach())
         critic_loss = torch.mean(
             F.mse_loss(self.critic.estimate_return(states), td_target.detach())
         )
-        self.actor.optimizer.zero_grad()
-        self.critic.optimizer.zero_grad()
-        actor_loss.backward()
-        critic_loss.backward()
-        self.actor.optimizer.step()
-        self.critic.optimizer.step()
+        self.actor.update_step(actor_loss)
+        self.critic.update_step(critic_loss)
 
 
 @dataclass
@@ -209,6 +264,19 @@ def main():
     action_dim = env.action_space.n
     actor_net = PolicyNet(state_dim, params.hidden_dim, action_dim)
     actor = Actor(actor_net, params.learning_rate, params.device)
+    critic_net = ValueNet(state_dim, params.hidden_dim)
+    critic = Critic(critic_net, params.learning_rate, params.device)
+    policy = ActorCritic(actor, critic, params.gamma, params.device)
+    trainer = OnPolicyTrainer(policy, env, params)
+    trainer.learn()
+
+    env_name = "Pendulum-v1"
+    env = gym.make(env_name)
+    params = A2CParams()
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
+    actor_net = PolicyNetContinuous(state_dim, params.hidden_dim, action_dim)
+    actor = GaussianContinuousActor(actor_net, params.learning_rate, params.device)
     critic_net = ValueNet(state_dim, params.hidden_dim)
     critic = Critic(critic_net, params.learning_rate, params.device)
     policy = ActorCritic(actor, critic, params.gamma, params.device)
