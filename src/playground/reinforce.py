@@ -1,7 +1,7 @@
 # -*- coding: UTF-8 -*-
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Type, Union
+from typing import Any, Dict, List, Type, Union, Tuple
 
 import gymnasium as gym
 import matplotlib.pyplot as plt
@@ -39,6 +39,20 @@ class PolicyNet(nn.Module):
         return F.softmax(self.fc2(x), dim=1)
 
 
+class PolicyNetContinuous(nn.Module):
+    def __init__(self, state_dim: int, hidden_dim: int, action_dim: int) -> None:
+        super(PolicyNetContinuous, self).__init__()
+        self.fc1 = nn.Linear(state_dim, hidden_dim)
+        self.fc_mu = nn.Linear(hidden_dim, action_dim)
+        self.fc_std = nn.Linear(hidden_dim, action_dim)
+
+    def forward(self, states: Observation) -> Tuple[torch.Tensor, torch.Tensor]:
+        states = F.relu(self.fc1(states))
+        mu = 2.0 * torch.tanh(self.fc_mu(states))
+        std = F.softplus(self.fc_std(states))
+        return mu, std
+
+
 def as_tensor(x, dtype=torch.float, device="cpu") -> torch.Tensor:
     return torch.as_tensor(x, dtype=dtype, device=device)
 
@@ -60,6 +74,45 @@ class Actor(object):
         action_dist = torch.distributions.Categorical(probs=probs)
         action = action_dist.sample()
         return action.item()
+
+    def update_step(self, loss: torch.Tensor) -> None:
+        self.optimizer.zero_grad()
+        loss.requires_grad_(True)
+        loss.backward()
+        self.optimizer.step()
+
+    def get_log_probs(self, states: Observation, actions: Action) -> torch.Tensor:
+        return torch.log(self.model(states).gather(1, actions)).detach()
+
+
+class GaussianContinuousActor(object):
+    def __init__(
+        self,
+        model: PolicyNetContinuous,
+        learning_rate: float = 0.001,
+        device: str = "cpu",
+    ) -> None:
+        self.model = model.to(device)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
+        self.device = device
+
+    def take_action(self, state: Observation) -> Action:
+        state = torch.tensor([state], dtype=torch.float).to(self.device)
+        mu, sigma = self.model(state)
+        action_dist = torch.distributions.Normal(mu, sigma)
+        action = action_dist.sample()
+        return [action.item()]
+
+    def update_step(self, loss: torch.Tensor) -> None:
+        self.optimizer.zero_grad()
+        loss.requires_grad_(True)
+        loss.backward()
+        self.optimizer.step()
+
+    def get_log_probs(self, states: Observation, actions: Action) -> torch.Tensor:
+        mu, std = self.model(states)
+        action_dist = torch.distributions.Normal(mu.detach(), std.detach())
+        return action_dist.log_prob(actions)
 
 
 @dataclass
@@ -99,19 +152,18 @@ class Reinforce(object):
         actions = [trajectory.action for trajectory in transitions]
 
         G = 0
-        self.actor.optimizer.zero_grad()
+        loss = 0
         for i in reversed(range(len(rewards))):
             reward = rewards[i]
             state = as_tensor([states[i]], dtype=torch.float, device=self.device)
             action = as_tensor(actions[i], dtype=torch.int64, device=self.device).view(
                 -1, 1
             )
-            log_prob = torch.log(self.actor.model(state).gather(1, action))
+            log_prob = self.actor.get_log_probs(state, action)
             G = self.gamma * G + reward
-            loss = -log_prob * G
-            loss.backward()
-        self.actor.optimizer.zero_grad()
-
+            loss += -log_prob * G
+        self.actor.update_step(loss)
+        
 
 class OnPolicyTrainer(object):
     def __init__(
@@ -168,7 +220,17 @@ def main():
     policy = Reinforce(actor, params.gamma, params.device)
     trainer = OnPolicyTrainer(policy, env, params)
     trainer.learn()
-
+    
+    env_name = "Pendulum-v1"
+    env = gym.make(env_name)
+    params = REINFORCEParams()
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
+    model = PolicyNetContinuous(state_dim, params.hidden_dim, action_dim)
+    actor = GaussianContinuousActor(model, params.learning_rate, params.device)
+    policy = Reinforce(actor, params.gamma, params.device)
+    trainer = OnPolicyTrainer(policy, env, params)
+    trainer.learn()
 
 if __name__ == "__main__":
     main()
