@@ -1,11 +1,12 @@
 # -*- coding: UTF-8 -*-
 
 import collections
+import copy
 import random
-from typing import Any, Dict, List, Tuple, Type
+from dataclasses import dataclass
+from typing import Any, List, Tuple, Type, Union
 
 import gymnasium as gym
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -19,6 +20,31 @@ Reward = Type[float]
 Experience = Type[Tuple[Observation, Action, Reward, Observation, bool]]
 Environment = gym.Env
 Value = Type[float]
+
+
+@dataclass
+class Trajectory(object):
+    state: Observation
+    action: Action
+    reward: Reward
+    next_state: Observation
+    done: bool
+
+
+class ReplayBuffer(object):
+    def __init__(self, capacity: int) -> None:
+        self.buffer: List[Trajectory] = collections.deque(maxlen=capacity)
+
+    def add(self, trajectory: Trajectory) -> int:
+        self.buffer.append(trajectory)
+        return self.size()
+
+    def size(self) -> int:
+        return len(self.buffer)
+
+    def sample(self, batch_size: int) -> List[Trajectory]:
+        transitions = random.sample(self.buffer, batch_size)
+        return transitions
 
 
 class PolicyNetContinuous(nn.Module):
@@ -57,49 +83,116 @@ class QValueNetContinuous(nn.Module):
         return self.fc3(x)
 
 
+def as_tensor(x, dtype=torch.float, device="cpu") -> torch.Tensor:
+    return torch.as_tensor(x, dtype=dtype, device=device)
+
+
+class Actor(object):
+    def __init__(
+        self,
+        model: nn.Module,
+        action_dim: int,
+        sigma: float,
+        learning_rate: float,
+        tau: float,
+        device: str = "cpu",
+    ) -> None:
+        self.model = model
+        self.action_dim = action_dim
+        self.sigma = sigma
+        self.device = device
+        self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
+        self.tau = tau
+
+    def __call__(self, states: Observation, *args: Any, **kwds: Any) -> float:
+        return self.model(states)
+
+    def values(self, states: Observation) -> float:
+        return self.model(states)
+
+    def take_action(self, states: Observation) -> Action:
+        states = torch.tensor([states], dtype=torch.float).to(self.device)
+        action = self.actor(states)[0]
+        return [action.item()]
+
+    def update_step(self, loss: torch.Tensor) -> None:
+        self.optimizer.zero_grad()
+        loss.requires_grad_(True)
+        loss.backward()
+        self.optimizer.step()
+
+    def max_q_values(self, state: Observation) -> float:
+        state = as_tensor([state])
+        return self.model(state).max().item()
+
+    def load_state_dict(self, actor: "Actor") -> None:
+        self.model.load_state_dict(actor.state_dict())
+
+    def state_dict(self) -> dict:
+        return self.model.state_dict()
+
+    def soft_update(self, net: nn.Module) -> None:
+        for net_parameter, target_net_parameter in zip(
+            net.parameters(), self.model.parameters()
+        ):
+            target_net_parameter.data.copy_(
+                target_net_parameter.data * (1.0 - self.tau)
+                + net_parameter.data * self.tau
+            )
+
+
+class Critic(object):
+    def __init__(
+        self,
+        model: QValueNetContinuous,
+        tau: float,
+        learning_rate: float = 0.001,
+        device: str = "cpu",
+    ) -> None:
+        self.model = model
+        self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
+        self.device = device
+        self.tau = tau
+
+    def estimate_return(self, state: Observation) -> Value:
+        return self.model(state)
+
+    def estimate_q_values(self, state: Observation, action: Action) -> Value:
+        return self.model(state, action)
+
+    def update_step(self, loss: torch.Tensor) -> None:
+        self.optimizer.zero_grad()
+        loss.requires_grad_(True)
+        loss.backward()
+        self.optimizer.step()
+
+    def soft_update(self, net: QValueNetContinuous) -> None:
+        for net_parameter, target_net_parameter in zip(
+            net.parameters(), self.model.parameters()
+        ):
+            target_net_parameter.data.copy_(
+                target_net_parameter.data * (1.0 - self.tau)
+                + net_parameter.data * self.tau
+            )
+
+
 class SAC(object):
     def __init__(
         self,
-        state_dim: int,
-        hidden_dim: int,
-        action_dim: int,
-        action_bound: float,
-        actor_learning_rate: float,
-        critic_learning_rate: float,
+        actor: Actor,
+        critic1: Critic,
+        critic2: Critic,
         alpha_learning_rate: float,
         target_entropy: float,
         tau: float,
         gamma: float,
         device: str = "cpu",
     ) -> None:
-        self.actor = PolicyNetContinuous(
-            state_dim, hidden_dim, action_dim, action_bound
-        ).to(device)
-        self.critic_1 = QValueNetContinuous(state_dim, hidden_dim, action_dim).to(
-            device
-        )
-        self.critic_2 = QValueNetContinuous(state_dim, hidden_dim, action_dim).to(
-            device
-        )
-        self.target_critic_1 = QValueNetContinuous(
-            state_dim, hidden_dim, action_dim
-        ).to(device)
-        self.target_critic_2 = QValueNetContinuous(
-            state_dim, hidden_dim, action_dim
-        ).to(device)
-
-        self.target_critic_1.load_state_dict(self.critic_1.state_dict())
-        self.target_critic_2.load_state_dict(self.critic_2.state_dict())
-
-        self.actor_optimizer = optim.Adam(
-            self.actor.parameters(), lr=actor_learning_rate
-        )
-        self.critic_1_optimizer = optim.Adam(
-            self.critic_1.parameters(), lr=critic_learning_rate
-        )
-        self.critic_2_optimizer = optim.Adam(
-            self.critic_2.parameters(), lr=critic_learning_rate
-        )
+        self.actor = actor
+        self.critic_1 = critic1
+        self.critic_2 = critic2
+        self.target_critic_1 = copy.copy(critic1)
+        self.target_critic_2 = copy.copy(critic2)
 
         self.log_alpha = torch.tensor(np.log(0.01), dtype=torch.float)
         self.log_alpha.requires_grad = True
@@ -120,69 +213,57 @@ class SAC(object):
     ) -> Value:
         next_actions, log_prob = self.actor(next_states)
         entropy = -log_prob
-        q1_value = self.target_critic_1(next_states, next_actions)
-        q2_value = self.target_critic_2(next_states, next_actions)
+        q1_value = self.target_critic_1.estimate_q_values(next_states, next_actions)
+        q2_value = self.target_critic_2.estimate_q_values(next_states, next_actions)
         next_value = torch.min(q1_value, q2_value) + self.log_alpha.exp() * entropy
         td_target = rewards + self.gamma * next_value * (1 - dones)
         return td_target
 
-    def soft_update(self, net: nn.Module, target_net: nn.Module) -> None:
-        for parameter, target_net_parameter in zip(
-            net.parameters(), target_net.parameters()
-        ):
-            target_net_parameter.data.copy_(
-                target_net_parameter.data * (1 - self.tau) + parameter.data * self.tau
-            )
-
-    def update(self, transition_dict: Any) -> None:
-        states = torch.tensor(transition_dict["states"], dtype=torch.float).to(
-            self.device
+    def update(self, trajectories: List[Trajectory]) -> None:
+        states = as_tensor(
+            [trajectory.state for trajectory in trajectories],
+            dtype=torch.float,
+            device=self.device,
         )
-        actions = (
-            torch.tensor(transition_dict["actions"], dtype=torch.float)
-            .view(-1, 1)
-            .to(self.device)
+        actions = as_tensor(
+            [trajectory.action for trajectory in trajectories], torch.int64, self.device
+        ).view(-1, 1)
+        rewards = as_tensor([trajectory.reward for trajectory in trajectories]).view(
+            -1, 1
         )
-        rewards = (
-            torch.tensor(transition_dict["rewards"], dtype=torch.float)
-            .view(-1, 1)
-            .to(self.device)
+        next_states = as_tensor(
+            [trajectory.next_state for trajectory in trajectories],
+            dtype=torch.float,
+            device=self.device,
         )
-        next_states = torch.tensor(
-            transition_dict["next_states"], dtype=torch.float
-        ).to(self.device)
-        dones = (
-            torch.tensor(transition_dict["dones"], dtype=torch.float)
-            .view(-1, 1)
-            .to(self.device)
-        )
+        dones = as_tensor(
+            [trajectory.done for trajectory in trajectories], torch.float, self.device
+        ).view(-1, 1)
         # 和之前章节一样,对倒立摆环境的奖励进行重塑以便训练
         rewards = (rewards + 8.0) / 8.0
 
         td_target = self.calc_target(rewards, next_states, dones)
         critic_1_loss = torch.mean(
-            F.mse_loss(self.critic_1(states, actions), td_target.detach())
+            F.mse_loss(
+                self.critic_1.estimate_q_values(states, actions), td_target.detach()
+            )
         )
         critic_2_loss = torch.mean(
-            F.mse_loss(self.critic_2(states, actions), td_target.detach())
+            F.mse_loss(
+                self.critic_2.estimate_q_values(states, actions), td_target.detach()
+            )
         )
-        self.critic_1_optimizer.zero_grad()
-        critic_1_loss.backward()
-        self.critic_1_optimizer.step()
-        self.critic_2_optimizer.zero_grad()
-        critic_2_loss.backward()
-        self.critic_2_optimizer.step()
+        self.critic_1.update_step(critic_1_loss)
+        self.critic_2.update_step(critic_2_loss)
 
         new_actions, log_prob = self.actor(states)
         entropy = -log_prob
-        q1_value = self.critic_1(states, new_actions)
-        q2_value = self.critic_2(states, new_actions)
+        q1_value = self.critic_1.estimate_q_values(states, new_actions)
+        q2_value = self.critic_2.estimate_q_values(states, new_actions)
         actor_loss = torch.mean(
             -self.log_alpha.exp() * entropy - torch.min(q1_value, q2_value)
         )
-        self.actor_optimizer.zero_grad()
-        actor_loss.backward()
-        self.actor_optimizer.step()
+        self.actor.update_step(actor_loss)
 
         alpha_loss = torch.mean(
             (entropy - self.target_entropy).detach() * self.log_alpha.exp()
@@ -191,102 +272,123 @@ class SAC(object):
         alpha_loss.backward()
         self.log_alpha_optimizer.step()
 
-        self.soft_update(self.critic_1, self.target_critic_1)
-        self.soft_update(self.critic_2, self.target_critic_2)
+        self.target_critic_1.soft_update(self.critic_1.model)
+        self.target_critic_2.soft_update(self.critic_2.model)
 
 
-def train_off_policy_agent(
-    env, agent, num_episodes, replay_buffer, minimal_size, batch_size
-):
-    return_list = []
-    for i in range(10):
-        with tqdm(total=int(num_episodes / 10), desc="Iteration %d" % i) as pbar:
-            for i_episode in range(int(num_episodes / 10)):
-                episode_return = 0
-                state, _ = env.reset()
-                done = False
-                while not done:
-                    action = agent.take_action(state)
-                    next_state, reward, terminated, truncated, _ = env.step(action)
-                    done = terminated or truncated
-                    replay_buffer.add(state, action, reward, next_state, done)
-                    state = next_state
-                    episode_return += reward
-                    if replay_buffer.size() > minimal_size:
-                        b_s, b_a, b_r, b_ns, b_d = replay_buffer.sample(batch_size)
-                        transition_dict = {
-                            "states": b_s,
-                            "actions": b_a,
-                            "next_states": b_ns,
-                            "rewards": b_r,
-                            "dones": b_d,
-                        }
-                        agent.update(transition_dict)
-                return_list.append(episode_return)
-                if (i_episode + 1) % 10 == 0:
-                    pbar.set_postfix(
-                        {
-                            "episode": "%d" % (num_episodes / 10 * i + i_episode + 1),
-                            "return": "%.3f" % np.mean(return_list[-10:]),
-                        }
-                    )
-                pbar.update(1)
-    return return_list
+@dataclass
+class Params(object):
+    pass
 
 
-class ReplayBuffer:
-    def __init__(self, capacity):
-        self.buffer = collections.deque(maxlen=capacity)
+@dataclass
+class SACParams(Params):
+    learning_rate: float = 1e-3
+    num_episodes: int = 500
+    gamma: float = 0.98
+    epsilon: float = 0.01
+    target_update: int = 10
+    buffer_size: int = 10000
+    minimal_size: int = 500
+    device: Union[str, torch.device] = "cpu"
+    epochs: int = 10
+    seed: int = 0
+    env_name: str = "CartPole-v0"
+    hidden_dim: int = 128
+    batch_size: int = 64
+    sigma: float = 0.01
+    tau: float = 0.005
+    alpha_learning_rate: float = 3e-3
 
-    def add(self, state, action, reward, next_state, done):
-        self.buffer.append((state, action, reward, next_state, done))
 
-    def sample(self, batch_size):
-        transitions = random.sample(self.buffer, batch_size)
-        state, action, reward, next_state, done = zip(*transitions)
-        return np.array(state), action, reward, np.array(next_state), done
+class OffPolicyTrainer(object):
+    def __init__(
+        self,
+        policy: SACX,
+        env: Environment,
+        params: Params,
+        replay_buffer: ReplayBuffer,
+    ) -> None:
+        self.policy = policy
+        self.env = env
+        self.params = params
+        self.replay_buffer = replay_buffer
 
-    def size(self):
-        return len(self.buffer)
+    def learn(self) -> None:
+        return_list = []
+        for i in range(self.params.epochs):
+            with tqdm(
+                total=int(self.params.num_episodes / 10), desc="Interation %d" % i
+            ) as pbar:
+                for i_episode in range(int(self.params.num_episodes / 10)):
+                    episode_return = 0
+                    state, _ = self.env.reset()
+                    done = False
+                    while not done:
+                        action = self.policy.take_action(state)
+                        next_state, reward, terminated, truncated, _ = self.env.step(
+                            action
+                        )
+                        done = terminated or truncated
+                        trajectory = Trajectory(state, action, reward, next_state, done)
+                        self.replay_buffer.add(trajectory)
+                        state = next_state
+                        episode_return += reward
+                        if self.replay_buffer.size() > self.params.minimal_size:
+                            trajectories = self.replay_buffer.sample(
+                                self.params.batch_size
+                            )
+                            self.policy.update(trajectories)
+
+                    return_list.append(episode_return)
+                    if (i_episode + 1) % 10 == 0:
+                        pbar.set_postfix(
+                            {
+                                "episode": (
+                                    self.params.num_episodes / 10 * i + i_episode + 1
+                                ),
+                                "return": np.mean(return_list[-10:]),
+                            }
+                        )
+                    pbar.update(1)
 
 
 def main():
     env_name = "Pendulum-v1"
     env = gym.make(env_name)
+    params = SACParams()
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
     action_bound = env.action_space.high[0]
-
-    actor_learning_rate = 3e-4
-    critic_learning_rate = 3e-3
-    alpha_learning_rate = 3e-4
-    num_episodes = 100
-    hidden_dim = 128
-    gamma = 0.99
-    tau = 0.005
-    buffer_size = 100000
-    minimal_size = 1000
-    batch_size = 64
     target_entropy = -env.action_space.shape[0]
-    device = "cpu"
-    replay_buffer = ReplayBuffer(buffer_size)
-    agent = SAC(
-        state_dim,
-        hidden_dim,
+    actor_net = PolicyNetContinuous(
+        state_dim, params.hidden_dim, action_dim, action_bound
+    )
+    actor = Actor(
+        actor_net,
         action_dim,
-        action_bound,
-        actor_learning_rate,
-        critic_learning_rate,
-        alpha_learning_rate,
+        params.sigma,
+        params.learning_rate,
+        params.tau,
+        params.device,
+    )
+    critic_net1 = QValueNetContinuous(state_dim, params.hidden_dim, action_dim)
+    critic1 = Critic(critic_net1, params.tau, params.learning_rate, params.device)
+    critic_net2 = QValueNetContinuous(state_dim, params.hidden_dim, action_dim)
+    critic2 = Critic(critic_net2, params.tau, params.learning_rate, params.device)
+    policy = SAC(
+        actor,
+        critic1,
+        critic2,
+        params.alpha_learning_rate,
         target_entropy,
-        tau,
-        gamma,
-        device,
+        params.tau,
+        params.gamma,
+        params.device,
     )
-
-    train_off_policy_agent(
-        env, agent, num_episodes, replay_buffer, minimal_size, batch_size
-    )
+    replay_buffer = ReplayBuffer(params.buffer_size)
+    trainer = OffPolicyTrainer(policy, env, params, replay_buffer)
+    trainer.learn()
 
 
 if __name__ == "__main__":
