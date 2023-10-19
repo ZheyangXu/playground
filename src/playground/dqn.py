@@ -102,6 +102,12 @@ class Actor(object):
             action = self.model(state).argmax().item()
         return action
 
+    def update_step(self, loss: torch.Tensor) -> None:
+        self.optimizer.zero_grad()
+        loss.requires_grad_(True)
+        loss.backward()
+        self.optimizer.step()
+
     def max_q_values(self, state: Observation) -> float:
         state = as_tensor([state])
         return self.model(state).max().item()
@@ -139,9 +145,7 @@ class DQN(object):
         q_targets = rewards + self.gamma * max_next_q_values * (1 - dones)
 
         loss = torch.mean(F.mse_loss(q_values, q_targets))
-        self.actor.optimizer.zero_grad()
-        loss.backward()
-        self.actor.optimizer.step()
+        self.actor.update_step(loss)
 
         if self.count % self.target_update == 0:
             self.target_actor.model.load_state_dict(self.actor.model.state_dict())
