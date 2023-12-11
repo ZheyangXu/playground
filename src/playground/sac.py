@@ -304,7 +304,7 @@ class SACParams(Params):
 class OffPolicyTrainer(object):
     def __init__(
         self,
-        policy: SACX,
+        policy: SAC,
         env: Environment,
         params: Params,
         replay_buffer: ReplayBuffer,
