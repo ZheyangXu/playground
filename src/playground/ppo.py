@@ -93,6 +93,9 @@ class Actor(object):
     def get_log_probs(self, states: Observation, actions: Action) -> torch.Tensor:
         return torch.log(self.model(states).gather(1, actions)).detach()
 
+    def compute_loss(self, *args, **kwargs) -> Loss:
+        pass
+
 
 class GaussianContinuousActor(object):
     def __init__(
@@ -123,6 +126,9 @@ class GaussianContinuousActor(object):
         action_dist = torch.distributions.Normal(mu.detach(), std.detach())
         return action_dist.log_prob(actions)
 
+    def compute_loss(self, *args, **kwargs) -> Loss:
+        pass
+
 
 class Critic(object):
     def __init__(
@@ -140,6 +146,9 @@ class Critic(object):
         loss.requires_grad_(True)
         loss.backward()
         self.optimizer.step()
+
+    def compute_loss(self, *args, **kwargs) -> Loss:
+        pass
 
 
 def compute_advantage(gamma: float, lmbda: float, td_delta: torch.Tensor) -> float:
